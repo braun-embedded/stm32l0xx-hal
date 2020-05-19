@@ -431,8 +431,8 @@ impl Buffer {
         where C: dma::Channel
     {
         let transfer_state = self.transfer_state(transfer);
-        if self.check_overrun(transfer_state) {
-            return Some(Err(Error::BufferOverrun));
+        if let Some(reason) = self.check_overrun(transfer_state) {
+            return Some(Err(Error::BufferOverrun(reason)));
         }
 
         if self.pos == transfer_state.pos {
@@ -457,11 +457,11 @@ impl Buffer {
         // check. Let's check again. If there's still no overrun, we know that
         // our value is valid.
         let transfer_state = self.transfer_state(transfer);
-        if self.check_overrun(transfer_state) {
+        if let Some(reason) = self.check_overrun(transfer_state) {
             // Strictly speaking, the overrun might have happened after our
             // read, and `value` might be valid. No way to know for sure though,
             // so let's assume overrun.
-            return Some(Err(Error::BufferOverrun));
+            return Some(Err(Error::BufferOverrun(reason)));
         }
 
         // Now we know that the value we read is totally fine. Let's advance the
@@ -497,10 +497,12 @@ impl Buffer {
         }
     }
 
-    fn check_overrun(&mut self, transfer_state: TransferState) -> bool {
+    fn check_overrun(&mut self, transfer_state: TransferState)
+        -> Option<BufferOverrun>
+    {
         let overrun = self.check_overrun_inner(transfer_state);
 
-        if overrun {
+        if let Some(_) = overrun {
             // An overrun occured, but that is not a catastrophic error. Values
             // got lost, but that doesn't mean we can't read the new values
             // starting now. Let's get the buffer into a consistent state to
@@ -522,7 +524,9 @@ impl Buffer {
         overrun
     }
 
-    fn check_overrun_inner(&mut self, transfer_state: TransferState) -> bool {
+    fn check_overrun_inner(&mut self, transfer_state: TransferState)
+        -> Option<BufferOverrun>
+    {
         if transfer_state.half && transfer_state.complete {
             // Each time we attempt a read, we clear both flags. If both flags
             // are set, then basically anything could have happened in between,
@@ -534,7 +538,12 @@ impl Buffer {
             // there's no way to distinguish this case from the DMA having
             // passed those marks multiple times, so we have to be conservative
             // and assume an overrun.
-            return true;
+            return Some(
+                self.make_overrun(
+                    transfer_state,
+                    OverrunReason::BothFlagsSet,
+                )
+            );
         }
 
         if transfer_state.complete {
@@ -546,7 +555,12 @@ impl Buffer {
                 // The read position was greater than the write position, so if
                 // the write position wrapped, it must have overtaken the read
                 // position. This is an overrun.
-                return true;
+                return Some(
+                    self.make_overrun(
+                        transfer_state,
+                        OverrunReason::WriteWrappedAndOvertookRead,
+                    )
+                );
             }
 
             // The write position has wrapped, so now the read position needs
@@ -559,10 +573,36 @@ impl Buffer {
         // compare read and write positions to make sure that we don't actually
         // have an overrun.
         if self.r_gt_w {
-            self.pos <= transfer_state.pos
+            if self.pos <= transfer_state.pos {
+                return Some(
+                    self.make_overrun(
+                        transfer_state,
+                        OverrunReason::ReadNotGreaterThanWrite,
+                    )
+                );
+            }
         }
         else {
-            self.pos > transfer_state.pos
+            if self.pos > transfer_state.pos {
+                return Some(
+                    self.make_overrun(
+                        transfer_state,
+                        OverrunReason::ReadGreaterThanWrite,
+                    )
+                );
+            }
+        }
+
+        None
+    }
+
+    fn make_overrun(&self, state: TransferState, reason: OverrunReason)
+        -> BufferOverrun
+    {
+        BufferOverrun {
+            read_pos:  self.pos,
+            write_pos: state.pos,
+            reason,
         }
     }
 }
@@ -617,7 +657,35 @@ pub enum Error {
     /// This is not a critical error, as a circular buffer is used, and the DMA
     /// just keeps writing more values. It does mean that some values in the
     /// buffer were overwritten though.
-    BufferOverrun,
+    BufferOverrun(BufferOverrun),
+}
+
+
+/// Holds additional information on a buffer overrun
+///
+/// This is mostly useful for debugging.
+#[derive(Debug)]
+pub struct BufferOverrun {
+    /// The read position at the time of the buffer overrun
+    pub read_pos: u16,
+
+    /// The write position at the time of the buffer overrun
+    pub write_pos: u16,
+
+    /// The reason why the buffer overrun was detected
+    pub reason: OverrunReason,
+}
+
+
+/// Specifies the exact reason why a buffer overrun was detected
+///
+/// This is mostly useful for debugging.
+#[derive(Debug)]
+pub enum OverrunReason {
+    BothFlagsSet,
+    WriteWrappedAndOvertookRead,
+    ReadNotGreaterThanWrite,
+    ReadGreaterThanWrite,
 }
 
 
